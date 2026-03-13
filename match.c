@@ -7,7 +7,7 @@
 #include <time.h>
 #define fab(a,b) for(int i=a;i<b;i++)
 
-int score = 0,ballnum=0;
+int score = 0,ballnum=0,overnum=1;
 bool hit = false;
 
 pthread_mutex_t scorelock;
@@ -66,9 +66,9 @@ void* batsman(void* arg){
 
     pthread_join(bowler_thread,NULL);
     pthread_join(batsman_thread,NULL);
-    print("\n");
+    printf("\n");
     }
-    
+    printf("%d over has been completed",overnum);
     sem_destroy(&crease);
     pthread_mutex_destroy(&scorelock);
     pthread_mutex_destroy(&fieldlock);
