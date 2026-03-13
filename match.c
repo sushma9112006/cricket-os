@@ -5,9 +5,9 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <time.h>
+#define fab(a,b) for(int i=a;i<b;i++)
 
-
-int score = 0;
+int score = 0,ballnum=0;
 bool hit = false;
 
 pthread_mutex_t scorelock;
@@ -18,7 +18,7 @@ sem_t crease;
 
 void* bowler(void* arg){
     pthread_mutex_lock(&fieldlock);
-    printf("Bowler delivered the ball\n");
+    printf("Bowler delivered %d ball",ballnum);
     hit = true;
     pthread_cond_signal(&hitcond);
     pthread_mutex_unlock(&fieldlock);
@@ -32,13 +32,14 @@ void* batsman(void* arg){
     while(!hit)
         pthread_cond_wait(&hitcond, &fieldlock);
 
+    hit=false;
     pthread_mutex_unlock(&fieldlock);
     pthread_mutex_lock(&scorelock);
 
-    int runs = srand() % 7;
+    int runs = rand() % 7;
     score += runs;
 
-    printf("Batsman scored %d runs. Total score = %d\n", runs, score);
+    printf("Stats after Ball %d  : scored %d runs. Total score = %d\n", ballnum ,runs, score);
     pthread_mutex_unlock(&scorelock);
     sem_post(&crease);
 
@@ -56,12 +57,15 @@ void* batsman(void* arg){
     pthread_t bowler_thread;
     pthread_t batsman_thread;
 
+    fab(1,7){
+        ballnum=i;
     pthread_create(&bowler_thread,NULL,bowler,NULL);
     pthread_create(&batsman_thread,NULL,batsman,NULL);
 
     pthread_join(bowler_thread,NULL);
     pthread_join(batsman_thread,NULL);
-
+    }
+    
     sem_destroy(&crease);
     pthread_mutex_destroy(&scorelock);
     pthread_mutex_destroy(&fieldlock);
