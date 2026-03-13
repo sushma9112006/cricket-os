@@ -18,7 +18,7 @@ sem_t crease;
 
 void* bowler(void* arg){
     pthread_mutex_lock(&fieldlock);
-    printf("Bowler delivered %d ball",ballnum);
+    printf("Bowler delivered %d ball\n",ballnum);
     hit = true;
     pthread_cond_signal(&hitcond);
     pthread_mutex_unlock(&fieldlock);
@@ -64,6 +64,7 @@ void* batsman(void* arg){
 
     pthread_join(bowler_thread,NULL);
     pthread_join(batsman_thread,NULL);
+    print("\n");
     }
     
     sem_destroy(&crease);
