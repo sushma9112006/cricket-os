@@ -36,7 +36,9 @@ void* batsman(void* arg){
     pthread_mutex_unlock(&fieldlock);
     pthread_mutex_lock(&scorelock);
 
-    int runs = rand() % 7;
+    //int runs = rand() % 7;
+    int arr[] = {1,1,1,1,1,2,2,2,2,2,4,4,4,4,4,6,6,6,3,3,5};
+    int runs = arr[rand() % 21];
     score += runs;
 
     printf("Stats after Ball %d  : scored %d runs. Total score = %d\n", ballnum ,runs, score);
