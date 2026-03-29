@@ -37,7 +37,6 @@ using namespace std;
 #define NUM_BOWLERS      7
 #define NUM_BATTERS      11
 #define NUM_FIELDERS     10
-#define CREASE_CAPACITY  2
 
 
 // ENUMS
@@ -160,7 +159,7 @@ struct RAG {
 } rag;
 
 
-// SYNC PRIMITIVES
+// SYNC Parameters
 
 pthread_mutex_t pitch_mutex   = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t score_mutex   = PTHREAD_MUTEX_INITIALIZER;
