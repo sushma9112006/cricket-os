@@ -61,7 +61,7 @@ Used to protect shared data:
 
 #### Condition Variables
 
-* Fielders wait on the condition variable **ball_hit_cond**, which is triggered when **match_state.ball_in_air** becomes true
+* Fielders wait on the condition variable **ball_hit_cond**, which is triggered when **match_state.ball_in_air** becomes true, indicating ball has been hit
 
 ---
 
@@ -81,8 +81,7 @@ Two scheduling strategies are implemented, you can choose either of these algori
 
 * Lower burst means higher priority
 
-* This prioritizes aggressive batters
-
+* This prioritizes batters with higher batting efficiency based on average and strike rate
 
 ---
 
@@ -174,7 +173,6 @@ Run:
 
 ## Limitations
 
-* True parallelism is limited since some threads are joined immediately
 * Deadlock detection handles simple cases, not full graph cycles
 * Scheduling is not exact OS CPU scheduling, they are modified versions according to our needs
 
@@ -190,3 +188,4 @@ Run:
 *Srutha Keerthi Cheruku(24114094)
 *Nitta Anshu Sri(24114063)
 
+---
