@@ -177,11 +177,6 @@ Run:
 * Scheduling is not exact OS CPU scheduling, they are modified versions according to our needs
 
 ---
-## Demo link
-
-
-
----
 ## Team members
 *Jakkula Charita Sai Sushma(24114044)
 *Ragala Akhil(24114072)
