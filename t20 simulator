@@ -1,0 +1,1133 @@
+/*
+ * T20 World Cup Cricket Simulator
+ * CSC-204 Operating Systems - Assignment 1
+ *
+ * MATCH: India vs New Zealand — 2026 ICC T20 World Cup Final, Ahmedabad
+ *
+ * ASSUMPTIONS:
+ * 1. Each team has 11 players: 7 bowlers (some double as batters), rest batters/WK.
+ * 2. A "ball" is one pthread task. The Pitch mutex ensures only one ball is live at a time.
+ * 3. Threat Factor recalculated after every over using runs scored that over, that is if
+      (runs in previous over)<=6 we choose q_normal queue bowler for the next over.
+ *    - Threat <= 6 : q_normal   - Threat 7-9 : q_econ   - Threat 10+ : q_wick
+ * 4. Batter selection (Innings 1): pace toward 200 target using RRR formula.
+ *    Batter selection (Innings 2): actual chase RRR.
+ * 5. Innings 2 starts only after Innings 1 ends (pthread_join serialises).
+ * 6. Run-out deadlock detection: RAG cycle detection with min-cost victim selection.
+ * 7. Wide = 1 extra + re-bowl. No-ball = 1 extra + free hit.
+ * 8. Dismissals shown with mode + fielder: "c Allen b Henry", "b Bumrah", etc.
+ * 9. Over numbering: 0.1 to 19.6 format.
+ * 10. POSIX semaphore (sem_t) used for crease capacity = 2 (replaces manual counter).
+ * 11. SJF scheduler: burst estimate = batting_avg*strike_rate (better batsman has higher burst estimate).
+ * 12. Gantt Chart logged per ball: who held the PITCH resource and when.
+ */
+
+#include <bits/stdc++.h>
+#include <pthread.h>
+#include <cstdlib>
+#include <semaphore.h>
+#include <unistd.h>
+using namespace std;
+
+
+// CONSTANTS
+
+#define TOTAL_OVERS      20
+#define BALLS_PER_OVER   6
+#define NUM_BOWLERS      7
+#define NUM_BATTERS      11
+#define NUM_FIELDERS     10
+#define CREASE_CAPACITY  2
+
+
+// ENUMS
+
+enum BallOutcome  { DOT, SINGLE, DOUBLE_RUN, TRIPLE, FOUR, SIX, WIDE, NO_BALL, WICKET };
+enum DismissalMode{ BOWLED, CAUGHT, LBW, STUMPED };
+enum BowlerQueue  { Q_NORMAL, Q_ECON, Q_WICK };
+enum SchedulerMode{ ROUND_ROBIN, SJF, PRIORITY };
+
+
+// PLAYER DATA
+
+struct BatterStats {
+    int    id;
+    string name;
+    double batting_avg;
+    double strike_rate;
+    string role;
+    bool   is_out        = false;
+    int    runs_scored   = 0;
+    int    balls_faced   = 0;
+    bool   at_crease     = false;
+    int    crease_end    = -1;
+    string dismissal     = "";
+    int    arrival_ball  = 0;
+    int    batting_start = 0;
+    int    wait_balls    = 0;
+    string first_ball_ob = "";
+    string last_ball_ob  = "";
+    string sched_entry   = "";
+    double sjf_burst() const {
+    double val = batting_avg * strike_rate;
+    return (val > 0) ? (1.0 / val) : 999.0;
+}
+};
+
+struct BowlerStats {
+    int    id;
+    string name;
+    int    overs_bowled  = 0;
+    int    runs_given    = 0;
+    int    wickets_taken = 0;
+    double economy       = 0.0;
+    string type;
+    int    saved_balls   = 0;
+};
+
+
+// SHARED STATE
+
+struct ScoreBoard {
+    int runs        = 0;
+    int wickets     = 0;
+    int balls_faced = 0;
+    int extras      = 0;
+};
+
+struct MatchState {
+    int  last_over_runs    = 0;
+    bool ball_in_air       = false;
+    bool free_hit          = false;
+    bool innings_done[2]   = {false, false};
+    bool innings_over[2]   = {false, false};
+};
+
+//RESOURCE ALLOCATION GRAPH  (run-out deadlock detection)
+
+struct RAG {
+    int held[NUM_BATTERS];
+    int want[NUM_BATTERS];
+    pthread_mutex_t mu;
+
+    void init() {
+        memset(held, -1, sizeof(held));
+        memset(want, -1, sizeof(want));
+        pthread_mutex_init(&mu, nullptr);
+    }
+    void destroy() { pthread_mutex_destroy(&mu); }
+
+    void acquire(int id, int end) {
+        pthread_mutex_lock(&mu);
+        held[id] = end; want[id] = -1;
+        pthread_mutex_unlock(&mu);
+    }
+    void release(int id) {
+        pthread_mutex_lock(&mu);
+        held[id] = -1; want[id] = -1;
+        pthread_mutex_unlock(&mu);
+    }
+    void request(int id, int end) {
+        pthread_mutex_lock(&mu);
+        want[id] = end;
+        pthread_mutex_unlock(&mu);
+    }
+
+    bool detectCycle(int cycle[2]) {
+        pthread_mutex_lock(&mu);
+        for (int i = 0; i < NUM_BATTERS; i++) {
+            if (held[i] < 0 || want[i] < 0) continue;
+            for (int j = 0; j < NUM_BATTERS; j++) {
+                if (i == j || held[j] < 0) continue;
+                if (held[i] != want[j] || held[j] != want[i]) continue;
+                cycle[0] = i; cycle[1] = j;
+                pthread_mutex_unlock(&mu);
+                return true;
+            }
+        }
+        for (int end = 0; end <= 1; end++) {
+            int first = -1;
+            for (int i = 0; i < NUM_BATTERS; i++) {
+                if (held[i] != end) continue;
+                if (first == -1) { first = i; }
+                else { cycle[0] = first; cycle[1] = i;
+                       pthread_mutex_unlock(&mu); return true; }
+            }
+        }
+        pthread_mutex_unlock(&mu);
+        return false;
+    }
+} rag;
+
+
+// SYNC PRIMITIVES
+
+pthread_mutex_t pitch_mutex   = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t score_mutex   = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex     = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t runout_mutex  = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t gantt_mutex   = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t  ball_hit_cond = PTHREAD_COND_INITIALIZER;
+
+sem_t crease_sem;
+
+ScoreBoard innings_score[2];
+MatchState match_state;
+
+int global_ball = 0;
+
+
+// GANTT CHART
+
+struct GanttEntry {
+    int    ball_number;
+    string over_ball;
+    string batter;
+    string bowler;
+    string outcome;
+    string sched_mode;
+};
+vector<GanttEntry> gantt_log;
+
+struct PlayerSpan {
+    string innings;
+    string batter;
+    string first_ball;
+    string last_ball;
+    int    start_global;
+    int    end_global;
+    int    runs;
+    int    balls;
+    string how_out;
+    string sched_at_entry;
+};
+vector<PlayerSpan> player_spans;
+
+// TEAMS  —  India (0) vs New Zealand (1)
+
+BatterStats team_batters[2][NUM_BATTERS] = {
+    {
+        {0,  "Abhishek",  28.0, 158.0, "aggressor"},
+        {1,  "Samson",    38.0, 145.0, "aggressor"},
+        {2,  "Surya",     43.0, 162.0, "aggressor"},
+        {3,  "Ishan",     32.0, 148.0, "aggressor"},
+        {4,  "Tilak",     30.0, 138.0, "anchor"},
+        {5,  "Hardik",    32.0, 146.0, "aggressor"},
+        {6,  "Axar",      22.0, 128.0, "anchor"},
+        {7,  "Dube",      20.0, 118.0, "anchor"},
+        {8,  "Varun",      7.0,  68.0, "tailender"},
+        {9,  "Arshdeep",   8.0,  72.0, "tailender"},
+        {10, "Bumrah",    10.0,  78.0, "tailender"}
+    },
+    {
+        {0,  "Seifert",   28.0, 138.0, "aggressor"},
+        {1,  "Allen",     38.0, 158.0, "aggressor"},
+        {2,  "Ravindra",  35.0, 132.0, "anchor"},
+        {3,  "Phillips",  35.0, 152.0, "aggressor"},
+        {4,  "Chapman",   28.0, 135.0, "anchor"},
+        {5,  "Mitchell",  36.0, 148.0, "aggressor"},
+        {6,  "Neesham",   25.0, 140.0, "aggressor"},
+        {7,  "Santner",   18.0, 112.0, "tailender"},
+        {8,  "McConchie", 14.0,  95.0, "tailender"},
+        {9,  "Henry",     10.0,  82.0, "tailender"},
+        {10, "Ferguson",   6.0,  65.0, "tailender"}
+    }
+};
+
+BowlerStats team_bowlers[2][NUM_BOWLERS] = {
+    {
+        {0, "Bumrah",   0,0,0,0.0, "wicket"},
+        {1, "Arshdeep", 0,0,0,0.0, "normal"},
+        {2, "Hardik",   0,0,0,0.0, "normal"},
+        {3, "Varun",    0,0,0,0.0, "wicket"},
+        {4, "Axar",     0,0,0,0.0, "econ"},
+        {5, "Dube",     0,0,0,0.0, "normal"},
+        {6, "Tilak",    0,0,0,0.0, "econ"}
+    },
+    {
+        {0, "Henry",      0,0,0,0.0, "wicket"},
+        {1, "Ferguson",   0,0,0,0.0, "wicket"},
+        {2, "Neesham",    0,0,0,0.0, "normal"},
+        {3, "Santner",    0,0,0,0.0, "econ"},
+        {4, "McConchie",  0,0,0,0.0, "econ"},
+        {5, "Phillips",   0,0,0,0.0, "normal"},
+        {6, "Ravindra",   0,0,0,0.0, "econ"}
+    }
+};
+
+string fielder_names[2][11] = {
+    {"Abhishek","Samson","Surya","Ishan","Tilak","Hardik","Axar","Dube","Varun","Arshdeep","Bumrah"},
+    {"Seifert","Allen","Ravindra","Phillips","Chapman","Mitchell","Neesham","Santner","McConchie","Henry","Ferguson"}
+};
+string wk_name[2] = {"Samson", "Seifert"};
+
+
+//RNG
+
+mt19937 rng_engine(random_device{}());
+int randomInt(int lo, int hi) {
+    uniform_int_distribution<int> d(lo, hi);
+    return d(rng_engine);
+}
+int randomBit() {
+    bernoulli_distribution d(0.5);
+    return d(rng_engine);
+}
+
+string overBall(int over, int ball) {
+    return to_string(over) + "." + to_string(ball);
+}
+
+BowlerQueue computeThreatQueue(int runs) {
+    if (runs <= 6) return Q_NORMAL;
+    if (runs <= 9) return Q_ECON;
+    return Q_WICK;
+}
+
+// BATTER SELECTION ENGINE
+
+int selectNextBatter(int team_idx, int bti, int overs_left,
+                     int runs_needed, int wkts, SchedulerMode sched) {
+    double rrr;
+    if (bti == 0) {
+        int still_needed = max(0, 200 - innings_score[0].runs);
+        rrr = (overs_left > 0) ? (double)still_needed / overs_left : 999.0;
+    } else {
+        rrr = (overs_left > 0) ? (double)runs_needed / overs_left : 999.0;
+    }
+
+    if (sched == SJF) {
+        int    best_id    = -1;
+        double best_burst = 1e9;
+        for (int i = 0; i < NUM_BATTERS; i++) {
+            BatterStats& b = team_batters[team_idx][i];
+            if (b.is_out || b.at_crease) continue;
+            if (b.sjf_burst() < best_burst) {
+                best_burst = b.sjf_burst();
+                best_id    = i;
+            }
+        }
+        if (best_id == -1) {
+            for (int i = 0; i < NUM_BATTERS; i++) {
+                BatterStats& b = team_batters[team_idx][i];
+                if (!b.is_out && !b.at_crease) { best_id = i; break; }
+            }
+        }
+        return best_id;
+    }
+    else if (sched == ROUND_ROBIN) {
+        for (int i = 0; i < NUM_BATTERS; i++) {
+            BatterStats& b = team_batters[team_idx][i];
+            if (!b.is_out && !b.at_crease) {
+                return i;
+            }
+        }
+    }
+    return -1;
+}
+
+
+// DISMISSAL DESCRIPTION
+
+string makeDismissal(DismissalMode mode, const string& bowler,
+                     int fielding_team) {
+    switch (mode) {
+        case BOWLED:   return "b " + bowler;
+        case LBW:      return "lbw b " + bowler;
+        case STUMPED:  return "st " + wk_name[fielding_team] + " b " + bowler;
+        case CAUGHT: {
+            int fi = randomInt(0, 10);
+            string catcher = fielder_names[fielding_team][fi];
+            for (int t = 0; t < 4 && catcher == bowler; t++)
+                catcher = fielder_names[fielding_team][randomInt(0,10)];
+            if (catcher == bowler) return "c & b " + bowler;
+            return "c " + catcher + " b " + bowler;
+        }
+    }
+    return "dismissed b " + bowler;
+}
+
+DismissalMode pickDismissalMode(const string& bowler_type) {
+    vector<int> w = {22, 52, 18, 8};
+    if (bowler_type == "econ") { w[3] += 6; w[1] -= 4; }
+    discrete_distribution<int> d(w.begin(), w.end());
+    return static_cast<DismissalMode>(d(rng_engine));
+}
+
+
+// BALL OUTCOME
+
+BallOutcome simulateBall(const BatterStats& bat, const BowlerStats& bowl,
+                         bool free_hit, int bti) {
+    vector<int> w = {20, 33, 11, 3, 15, 7, 4, 2, 5};
+
+    if      (bat.strike_rate >= 155) { w[4]+=3; w[5]+=2; w[0]-=3; }
+    else if (bat.strike_rate >= 140) { w[4]+=2; w[5]+=1; w[0]-=2; }
+    else if (bat.strike_rate <= 95 ) { w[0]+=4; w[4]-=2; w[5]-=2; w[8]+=2; }
+    else if (bat.strike_rate <= 115) { w[0]+=2; w[4]-=1; w[8]+=1; }
+
+    if      (bowl.type=="wicket") { w[8]+=3; w[0]+=2; w[4]-=1; }
+    else if (bowl.type=="econ")   { w[0]+=2; w[4]-=2; w[5]-=1; }
+    else                          { w[1]+=1; w[4]+=1; }
+
+    int balls_done = innings_score[bti].balls_faced;
+    int runs_live  = innings_score[bti].runs;
+    int wkts_live  = innings_score[bti].wickets;
+    const int TMIN = 130, TMAX = 230;
+
+    if (balls_done >= 6) {
+        double rpb       = (double)runs_live / balls_done;
+        int    projected = (int)(rpb * 120);
+
+        if (wkts_live < 7) {
+            if      (projected > TMAX + 30) { w[8]+=8; w[0]+=7; w[4]-=5; w[5]-=4; }
+            else if (projected > TMAX + 15) { w[8]+=5; w[0]+=5; w[4]-=3; w[5]-=2; }
+            else if (projected > TMAX)      { w[8]+=3; w[0]+=3; w[4]-=2; }
+            else if (projected < TMIN - 20) { w[8]-=6; w[0]-=6; w[4]+=5; w[5]+=4; }
+            else if (projected < TMIN)      { w[8]-=3; w[0]-=3; w[4]+=3; w[5]+=2; }
+        } else {
+            if (projected > TMAX) { w[8]+=4; w[0]+=3; w[4]-=2; }
+        }
+    }
+
+    if (balls_done <= 10 && wkts_live >= 3) {
+        w[8] -= 5; w[0] -= 4; w[4] += 4; w[5] += 2;
+    }
+
+    if (wkts_live >= 9)      { w[8]+=5; w[0]+=4; w[4]-=2; w[5]-=2; }
+    else if (wkts_live >= 7) { w[8]+=3; w[0]+=2; w[4]-=1; w[5]-=1; }
+
+    for (auto& x : w) x = max(x, 1);
+    w[4] = min(w[4], 20); w[5] = min(w[5], 12);
+    w[8] = min(w[8], 20); w[0] = min(w[0], 35);
+
+    if (free_hit) w[8] = 0;
+
+    discrete_distribution<int> dist(w.begin(), w.end());
+    return static_cast<BallOutcome>(dist(rng_engine));
+}
+
+// FIELDER THREAD
+
+struct FielderArg { int id; int team_idx; };
+
+void* fielderThread(void* arg) {
+    FielderArg* fa = (FielderArg*)arg;
+    while (true) {
+        pthread_mutex_lock(&score_mutex);
+        while (!match_state.ball_in_air && !match_state.innings_over[fa->team_idx])
+            pthread_cond_wait(&ball_hit_cond, &score_mutex);
+        pthread_mutex_unlock(&score_mutex);
+
+        if (match_state.innings_over[fa->team_idx] ||
+            innings_score[fa->team_idx].wickets     >= 10 ||
+            innings_score[fa->team_idx].balls_faced >= TOTAL_OVERS * BALLS_PER_OVER)
+            break;
+
+        usleep(randomInt(80, 500));
+    }
+    delete fa;
+    return nullptr;
+}
+
+
+// RUN-OUT DEADLOCK DETECTION  (RAG-based)
+
+
+int checkRunOut(int bat_team, int ba, int bb, int field_team) {
+    if (ba < 0 || bb < 0 || ba >= NUM_BATTERS || bb >= NUM_BATTERS || ba == bb)
+        return -1;
+
+    pthread_mutex_lock(&runout_mutex);
+
+    BatterStats& a = team_batters[bat_team][ba];
+    BatterStats& b = team_batters[bat_team][bb];
+
+    if (!a.at_crease || !b.at_crease || a.is_out || b.is_out) {
+        pthread_mutex_unlock(&runout_mutex);
+        return -1;
+    }
+
+    int end_a = (a.crease_end == 0) ? 1 : 0;
+    int end_b = b.crease_end;
+
+    if (end_a == end_b) {
+        rag.request(ba, end_a);
+        rag.request(bb, end_b);
+
+        pthread_mutex_lock(&log_mutex);
+        cout << "  [RAG] Run-out attempt: "
+             << a.name << " and " << b.name
+             << " both heading to end " << end_a
+             << " — checking for deadlock cycle...\n";
+        cout<<endl;
+        cout<<endl;
+        pthread_mutex_unlock(&log_mutex);
+    }
+
+    int cycle[2] = {-1, -1};
+    if (!rag.detectCycle(cycle)) {
+        pthread_mutex_unlock(&runout_mutex);
+        return -1;
+    }
+
+    BatterStats& x = team_batters[bat_team][cycle[0]];
+    BatterStats& y = team_batters[bat_team][cycle[1]];
+
+    double cost_x = x.strike_rate * (1.0 + x.runs_scored / 10.0);
+    double cost_y = y.strike_rate * (1.0 + y.runs_scored / 10.0);
+
+    int victim   = (cost_x <= cost_y) ? cycle[0] : cycle[1];
+    int survivor = (victim == cycle[0]) ? cycle[1] : cycle[0];
+
+    string ro_fielder = fielder_names[field_team][randomInt(0, 10)];
+
+    team_batters[bat_team][victim].is_out    = true;
+    team_batters[bat_team][victim].at_crease = false;
+    team_batters[bat_team][victim].dismissal = "run out (" + ro_fielder + ")";
+
+    int safe_end = (team_batters[bat_team][victim].crease_end == 0) ? 1 : 0;
+    team_batters[bat_team][survivor].crease_end = safe_end;
+
+    rag.release(victim);
+    rag.acquire(survivor, safe_end);
+
+    pthread_mutex_lock(&log_mutex);
+    cout << "  [UMPIRE/DEADLOCK] RAG cycle resolved — run-out!\n";
+    cout << "    Victim   (cost=" << fixed << setprecision(1) << cost_x << "): "
+         << team_batters[bat_team][victim].name   << "\n";
+    cout << "    Survivor (cost=" << fixed << setprecision(1) << cost_y << "): "
+         << team_batters[bat_team][survivor].name << "\n";
+    cout << "    run out (" << ro_fielder << ")\n";
+
+    cout<<endl;
+    cout<<endl;
+    pthread_mutex_unlock(&log_mutex);
+
+    pthread_mutex_lock(&score_mutex);
+    innings_score[bat_team].wickets++;
+    if (innings_score[bat_team].wickets >= 10) {
+        match_state.innings_over[bat_team] = true;
+        pthread_cond_broadcast(&ball_hit_cond);
+    }
+    pthread_mutex_unlock(&score_mutex);
+
+    sem_post(&crease_sem);
+
+    pthread_mutex_unlock(&runout_mutex);
+    return victim;   // caller must update its striker/non_striker pointer
+}
+
+// OVER ARG
+
+struct OverArg {
+    int  ti, bti, over, bowler_id;
+    int* striker;
+    int* non_striker;
+    SchedulerMode sched;
+    int  target;         
+};
+
+// helper: bring next batter to crease after any dismissal
+
+static void bringNextBatter(int bti, int over, int dead_idx,
+                             OverArg* oa, const string& sched_str) {
+    int ol = TOTAL_OVERS - over - 1;
+    int rn = (bti == 1) ? max(0, innings_score[0].runs + 1
+                                 - innings_score[1].runs) : 0;
+    int nx = selectNextBatter(bti, bti, ol, rn,
+                              innings_score[bti].wickets, oa->sched);
+    if (nx == -1) return;
+
+    sem_wait(&crease_sem);
+    team_batters[bti][nx].arrival_ball = global_ball;
+    team_batters[bti][nx].sched_entry  = sched_str;
+    team_batters[bti][nx].at_crease    = true;
+    team_batters[bti][nx].crease_end   = 0;
+    rag.acquire(nx, 0);
+    team_batters[bti][nx].wait_balls =
+        team_batters[bti][nx].batting_start - team_batters[bti][nx].arrival_ball;
+
+    if (*(oa->striker) == dead_idx)
+        *(oa->striker) = nx;
+    else
+        *(oa->non_striker) = nx;
+
+    pthread_mutex_lock(&log_mutex);
+    cout << "  >> " << team_batters[bti][nx].name
+         << " comes to crease  (SR="
+         << team_batters[bti][nx].strike_rate
+         << ", " << team_batters[bti][nx].role
+         << ", sched=" << sched_str << ")\n";
+
+    cout<<endl;
+    cout<<endl;
+    pthread_mutex_unlock(&log_mutex);
+}
+
+
+// BOWLER THREAD — one complete over
+
+void* bowlerThread(void* arg) {
+    OverArg* oa  = (OverArg*)arg;
+    int ti       = oa->ti;
+    int bti      = oa->bti;
+    int over     = oa->over;
+    int bid      = oa->bowler_id;
+
+    BowlerStats& bowl = team_bowlers[ti][bid];
+    int legal_balls = 0, over_runs = 0;
+
+    pthread_mutex_lock(&log_mutex);
+    cout << "\nOVER " << (over+1) << "  "
+         << bowl.name << "  [" << bowl.type << "]\n";
+    pthread_mutex_unlock(&log_mutex);
+
+    while (legal_balls < BALLS_PER_OVER) {
+
+        pthread_mutex_lock(&pitch_mutex);
+
+        if (innings_score[bti].wickets >= 10 || match_state.innings_over[bti] ||
+            (oa->target > 0 && innings_score[bti].runs > oa->target)) {
+            pthread_mutex_unlock(&pitch_mutex);
+            break;
+        }
+
+        int s  = *(oa->striker);
+        int ns = *(oa->non_striker);
+
+        BatterStats& bat = team_batters[bti][s];
+
+        BallOutcome out = simulateBall(bat, bowl, match_state.free_hit, bti);
+        match_state.free_hit = false;
+
+        string ob = to_string(over) + "." + to_string(legal_balls+1);
+        int runs_ball = 0;
+        string desc = ob + "  " + bat.name + " v " + bowl.name + "  →  ";
+        string sched_str = (oa->sched == SJF) ? "SJF" :
+                           (oa->sched == PRIORITY) ? "PRIORITY" : "RR";
+
+        if (bat.batting_start == 0 && bat.balls_faced == 0) {
+            bat.batting_start = global_ball;
+            bat.first_ball_ob = ob;
+        }
+        bat.last_ball_ob = ob;
+
+        switch (out) {
+            case DOT:
+                desc += "dot";
+                break;
+
+            case SINGLE:
+                runs_ball = 1; desc += "1 run";
+               
+                if (!team_batters[bti][*(oa->striker)].is_out &&
+                    !team_batters[bti][*(oa->non_striker)].is_out &&
+                     team_batters[bti][*(oa->striker)].at_crease &&
+                     team_batters[bti][*(oa->non_striker)].at_crease)
+                    swap(*(oa->striker), *(oa->non_striker));
+                break;
+
+            case DOUBLE_RUN:
+                runs_ball = 2; desc += "2 runs";
+                break;
+
+            case TRIPLE:
+                runs_ball = 3; desc += "3 runs";
+                
+                if (!team_batters[bti][*(oa->striker)].is_out &&
+                    !team_batters[bti][*(oa->non_striker)].is_out &&
+                     team_batters[bti][*(oa->striker)].at_crease &&
+                     team_batters[bti][*(oa->non_striker)].at_crease)
+                    swap(*(oa->striker), *(oa->non_striker));
+                break;
+
+            case FOUR:
+                runs_ball = 4; desc += "FOUR!";
+                pthread_mutex_lock(&score_mutex);
+                match_state.ball_in_air = true;
+                pthread_cond_broadcast(&ball_hit_cond);
+                match_state.ball_in_air = false;
+                pthread_mutex_unlock(&score_mutex);
+                break;
+
+            case SIX:
+                runs_ball = 6; desc += "SIX!!";
+                pthread_mutex_lock(&score_mutex);
+                match_state.ball_in_air = true;
+                pthread_cond_broadcast(&ball_hit_cond);
+                match_state.ball_in_air = false;
+                pthread_mutex_unlock(&score_mutex);
+                break;
+
+            case WIDE:
+                pthread_mutex_lock(&score_mutex);
+                innings_score[bti].extras++;
+                innings_score[bti].runs++;
+                over_runs++; bowl.runs_given++;
+                pthread_mutex_unlock(&score_mutex);
+                pthread_mutex_unlock(&pitch_mutex);
+                pthread_mutex_lock(&log_mutex);
+                cout << ob << "  " << bat.name << " v " << bowl.name
+                     << "  →  Wide  [" << innings_score[bti].runs
+                     << "/" << innings_score[bti].wickets << "]\n";
+
+                cout<<endl;
+                cout<<endl;
+                pthread_mutex_unlock(&log_mutex);
+                continue;
+
+            case NO_BALL:
+                match_state.free_hit = true;
+                pthread_mutex_lock(&score_mutex);
+                innings_score[bti].extras++;
+                innings_score[bti].runs++;
+                over_runs++; bowl.runs_given++;
+                pthread_mutex_unlock(&score_mutex);
+                pthread_mutex_unlock(&pitch_mutex);
+                pthread_mutex_lock(&log_mutex);
+                cout << ob << "  " << bat.name << " v " << bowl.name
+                     << "  →  No ball (+1, FREE HIT)  ["
+                     << innings_score[bti].runs << "/"
+                     << innings_score[bti].wickets << "]\n";
+
+                cout<<endl;
+                cout<<endl;
+                pthread_mutex_unlock(&log_mutex);
+                continue;
+
+            case WICKET: {
+                DismissalMode dm  = pickDismissalMode(bowl.type);
+                string        dis = makeDismissal(dm, bowl.name, ti);
+                bat.dismissal  = dis;
+                bat.is_out     = true;
+                bat.at_crease  = false;
+                rag.release(s);
+                sem_post(&crease_sem);
+                bowl.wickets_taken++;
+                desc += "OUT!  " + bat.name + "  " + dis;
+                pthread_mutex_lock(&score_mutex);
+                innings_score[bti].wickets++;
+                pthread_mutex_unlock(&score_mutex);
+                break;
+            }
+        }
+
+        pthread_mutex_lock(&score_mutex);
+        innings_score[bti].runs       += runs_ball;
+        innings_score[bti].balls_faced++;
+        over_runs    += runs_ball;
+        bowl.runs_given += runs_ball;
+        bat.runs_scored += runs_ball;
+        bat.balls_faced++;
+        global_ball++;
+        pthread_mutex_unlock(&score_mutex);
+
+        string outcome_str = (runs_ball == 0 && out != WICKET) ? "dot" :
+                             (out == WICKET) ? "OUT" :
+                             (out == FOUR)   ? "FOUR" :
+                             (out == SIX)    ? "SIX"  :
+                             to_string(runs_ball) + "run";
+        pthread_mutex_lock(&gantt_mutex);
+        gantt_log.push_back({(int)gantt_log.size()+1, ob, bat.name,
+                             bowl.name, outcome_str, sched_str});
+        pthread_mutex_unlock(&gantt_mutex);
+
+        legal_balls++;
+        desc += "  [" + to_string(innings_score[bti].runs)
+              + "/" + to_string(innings_score[bti].wickets) + "]";
+
+        pthread_mutex_lock(&log_mutex);
+        cout << desc << "\n";
+        pthread_mutex_unlock(&log_mutex);
+
+        pthread_mutex_unlock(&pitch_mutex);
+
+
+        if (out == WICKET && innings_score[bti].wickets < 10) {
+            bringNextBatter(bti, over, s, oa, sched_str);
+        }
+
+        // 5% run-out on running balls
+      
+        if ((out == SINGLE || out == DOUBLE_RUN || out == TRIPLE)
+            && randomInt(1,20) == 1) {
+            int victim = checkRunOut(bti, s, ns, ti);
+            if (victim != -1 && innings_score[bti].wickets < 10) {
+                bringNextBatter(bti, over, victim, oa, sched_str);
+            }
+        }
+
+        usleep(25000);
+    }
+
+    bowl.saved_balls  = legal_balls;
+    bowl.overs_bowled++;
+    bowl.economy = bowl.overs_bowled > 0
+                 ? (double)bowl.runs_given / bowl.overs_bowled : 0.0;
+    match_state.last_over_runs = over_runs;
+
+    delete oa;
+    return nullptr;
+}
+
+
+// INNINGS SIMULATOR
+
+struct InningsArg { int bat_team; int bowl_team; int target; int schd; };
+
+void* simulateInnings(void* arg) {
+    InningsArg* ia = (InningsArg*)arg;
+    int schd = ia->schd;
+    int bti = ia->bat_team, ti = ia->bowl_team, target = ia->target;
+    string bn = (bti==0)?"India":"New Zealand";
+
+    queue<int> q_normal, q_econ, q_wick;
+    for (int i = 0; i < NUM_BOWLERS; i++) {
+        string t = team_bowlers[ti][i].type;
+        if      (t=="normal") q_normal.push(i);
+        else if (t=="econ")   q_econ.push(i);
+        else                  q_wick.push(i);
+    }
+    map<int,int> ovb;
+
+    SchedulerMode sched;
+    if (schd == 0)
+        sched = ROUND_ROBIN;
+    else
+        sched = SJF;
+
+    
+    int striker = selectNextBatter(bti, bti, TOTAL_OVERS, 0, 0, sched);
+    team_batters[bti][striker].at_crease  = true;
+    team_batters[bti][striker].crease_end = 0;
+    team_batters[bti][striker].sched_entry = (sched==SJF)?"SJF":"RR";
+    rag.acquire(striker, 0);
+
+    int non_striker = selectNextBatter(bti, bti, TOTAL_OVERS, 0, 0, sched);
+    team_batters[bti][non_striker].at_crease  = true;
+    team_batters[bti][non_striker].crease_end = 1;
+    team_batters[bti][non_striker].sched_entry = (sched==SJF)?"SJF":"RR";
+    rag.acquire(non_striker, 1);
+
+    sem_init(&crease_sem, 0, 0);
+
+    pthread_mutex_lock(&log_mutex);
+    cout << "  INNINGS " << (bti+1) << "  |  " << bn << " batting\n";
+    if (target > 0)
+        cout << "  TARGET: " << target << " runs in " << TOTAL_OVERS << " overs\n";
+
+    cout<<"\n";
+    cout<<"\n";
+    pthread_mutex_unlock(&log_mutex);
+
+    pthread_t fielder_threads[NUM_FIELDERS];
+    for (int f = 0; f < NUM_FIELDERS; f++) {
+        FielderArg* fa = new FielderArg{f, bti};
+        pthread_create(&fielder_threads[f], nullptr, fielderThread, fa);
+    }
+
+    for (int over = 0; over < TOTAL_OVERS; over++) {
+        if (innings_score[bti].wickets >= 10 || match_state.innings_over[bti]) break;
+        if (target > 0 && innings_score[bti].runs >= target)                   break;
+
+        BowlerQueue qt = computeThreatQueue(match_state.last_over_runs);
+        int bid = -1;
+        
+if (over >= 14 && bid == -1) {
+
+    auto pick = [&](queue<int>& q) -> int {
+        int n = (int)q.size();
+        while (n-- > 0) {
+            int f = q.front(); q.pop();
+            if (ovb[f] < 4) { q.push(f); return f; }
+            q.push(f);
+        }
+        return -1;
+    };
+
+    bid = pick(q_wick);     
+    if (bid == -1)
+        bid = pick(q_econ); 
+
+    if (bid == -1)
+        bid = pick(q_normal); 
+}
+        if (bid == -1) {
+            auto pick = [&](queue<int>& q) -> int {
+                int n = (int)q.size();
+                while (n-- > 0) {
+                    int f = q.front(); q.pop();
+                    if (ovb[f] < 4) { q.push(f); return f; }
+                    q.push(f);
+                }
+                return -1;
+            };
+            if      (qt==Q_NORMAL) bid = pick(q_normal);
+            else if (qt==Q_ECON)   bid = pick(q_econ);
+            else                   bid = pick(q_wick);
+        }
+        if (bid == -1)
+            for (int i=0;i<NUM_BOWLERS;i++) if (ovb[i]<4){ bid=i; break; }
+        if (bid == -1) {
+            pthread_mutex_lock(&log_mutex);
+            cout << "[WARN] No bowler for over " << (over+1) << "\n";
+            pthread_mutex_unlock(&log_mutex);
+            break;
+        }
+        ovb[bid]++;
+
+        OverArg* oa = new OverArg{ti, bti, over, bid, &striker, &non_striker, sched,target};
+        pthread_t bt;
+        pthread_create(&bt, nullptr, bowlerThread, oa);
+        pthread_join(bt, nullptr);
+
+         
+        string sched_name = (sched==ROUND_ROBIN)?"RR":(sched==SJF)?"SJF":"PRIORITY";
+        string qname = (computeThreatQueue(match_state.last_over_runs)==Q_NORMAL)?"NORMAL":
+                       (computeThreatQueue(match_state.last_over_runs)==Q_ECON)  ?"ECON":"WICKET";
+        pthread_mutex_lock(&log_mutex);
+        cout << "  [CONTEXT SWITCH] " << team_bowlers[ti][bid].name
+             << "  over_runs=" << match_state.last_over_runs
+             << "  scheduler=" << sched_name
+             << "  next_queue=" << qname << "\n";
+
+        cout<<"\n";
+        pthread_mutex_unlock(&log_mutex);
+
+        swap(striker, non_striker);
+    }
+
+    pthread_mutex_lock(&score_mutex);
+    match_state.innings_over[bti] = true;
+    pthread_cond_broadcast(&ball_hit_cond);
+    pthread_mutex_unlock(&score_mutex);
+    for (int f=0;f<NUM_FIELDERS;f++) pthread_join(fielder_threads[f], nullptr);
+
+    int tb = innings_score[bti].balls_faced;
+    pthread_mutex_lock(&log_mutex);
+    cout << "  " << bn << "  "
+         << innings_score[bti].runs << "/" << innings_score[bti].wickets
+         << "  (" << tb/6 << "." << tb%6 << " ov)"
+         << "  Extras: " << innings_score[bti].extras << "\n";
+    cout << "\n  BATTING\n";
+    cout << "  " << string(62,'-') << "\n";
+
+    cout<<endl;
+    cout<<endl;
+    for (int i=0;i<NUM_BATTERS;i++) {
+        BatterStats& b = team_batters[bti][i];
+        if (b.balls_faced == 0 && !b.at_crease) continue;
+        string status = b.is_out ? b.dismissal : "not out";
+        cout << "  " << left  << setw(12) << b.name
+             << right << setw(5)  << b.runs_scored
+             << "  (" << setw(3) << b.balls_faced << "b)  "
+             << left  << status << "\n";
+        
+        cout<<endl;
+        cout<<endl;     
+    }
+    cout << "\n  BOWLING\n";
+    cout << "  " << string(42,'-') << "\n";
+    cout << "  " << left << setw(12) << "Bowler"
+         << setw(5) << "O" << setw(5) << "R" << setw(5) << "W" << "  Eco\n";
+
+    cout<<endl;
+    cout<<endl;
+    for (int i=0;i<NUM_BOWLERS;i++) {
+        BowlerStats& bw = team_bowlers[ti][i];
+        if (bw.overs_bowled == 0) continue;
+        cout << "  " << left  << setw(12) << bw.name
+             << right << setw(3) << bw.overs_bowled
+             << setw(6) << bw.runs_given
+             << setw(5) << bw.wickets_taken
+             << "  " << fixed << setprecision(2) << bw.economy << "\n";
+
+        cout<<endl;
+        cout<<endl;
+    }
+    pthread_mutex_unlock(&log_mutex);
+
+    match_state.innings_done[bti] = true;
+    delete ia;
+    return nullptr;
+}
+
+
+
+
+void printDotGanttChart() {
+    cout << "   DOT GANTT CHART (Each dot = 1 ball)\n";
+    int total = gantt_log.size();
+    cout << "Balls 1 to " << total << "\n";
+
+    vector<string> order;
+    unordered_map<string, string> batter_line;
+
+    for (auto &g : gantt_log) {
+        if (batter_line.find(g.batter) == batter_line.end()) {
+            order.push_back(g.batter);
+            batter_line[g.batter] = "";
+        }
+        batter_line[g.batter].resize(g.ball_number - 1, ' ');
+        batter_line[g.batter] += ".";
+    }
+
+    for (auto &name : order) {
+        cout << setw(12) << left << name << ": " << batter_line[name] << "\n";
+
+        cout<<endl;
+        cout<<endl;
+    }
+
+    cout << "\nLegend: '.' = batter faced that ball\n";
+    cout<<endl;
+    cout<<endl;
+}
+
+
+
+
+void printWaitTimeAnalysis(int bat_first) {
+    cout << "   SCHEDULING ANALYSIS — WAIT TIME\n";
+    cout << "   SJF or FCFS is used to schedule batsmen of both teams\n";
+
+    string teams[2] = {"India", "New Zealand"};
+    for (int t = 0; t < 2; t++) {
+        cout << "\n  " << teams[t] << ":\n";
+        cout << "  " << left << setw(12) << "Batter"
+             << setw(10) << "Role"
+             << setw(12) << "Arrival(b)"
+             << setw(12) << "Start(b)"
+             << setw(10) << "Wait(b)"
+             << "SJF_burst\n";
+        cout << "  " << string(58, '-') << "\n";
+
+
+        cout<<endl;
+        cout<<endl;
+        double total_wait = 0; int count = 0;
+        for (int i = 2; i <= 6; i++) {
+            BatterStats& b = team_batters[t][i];
+            if (b.balls_faced == 0 && b.arrival_ball == 0) continue;
+            int wait = max(0, b.batting_start - b.arrival_ball);
+            total_wait += wait; count++;
+            cout << "  " << left  << setw(12) << b.name
+                 << setw(10) << b.role
+                 << right << setw(10) << b.arrival_ball
+                 << setw(12) << b.batting_start
+                 << setw(10) << wait
+                 << "  " << fixed << setprecision(1) << b.sjf_burst() << "\n";
+            cout<<endl;
+            cout<<endl;
+        }
+        if (count > 0)
+            cout << "  Avg middle-order wait: "
+                 << fixed << setprecision(2) << total_wait/count << " balls\n";
+
+                 cout<<endl;
+                 
+                 cout<<endl;
+    }
+
+    cout << "\n  NOTE: Under pure SJF, batters with lower batting_avg\n";
+    cout << "  (shorter burst estimate) are sent in first during overs 7-14.\n";
+    cout << "  Under FCFS, batting order is strictly maintained.\n";
+    cout << "  Lower avg wait = better CPU utilisation of the PITCH resource.\n";
+}
+
+void printResult(int bat_first) {
+    string teams[2] = {"India","New Zealand"};
+    int t1 = innings_score[bat_first].runs;
+    int t2 = innings_score[1-bat_first].runs;
+    int w2 = innings_score[1-bat_first].wickets;
+    
+    cout << "     2026 ICC T20 WORLD CUP FINAL — RESULT\n";
+    cout << "  " << teams[bat_first]   << " (bat 1st): " << t1 << "\n";
+    cout << "  " << teams[1-bat_first] << " (chasing): " << t2 << "/" << w2 << "\n";
+    
+    if      (t2 > t1) cout << "  " << teams[1-bat_first] << " WON by " << (10-w2) << " wicket(s)!\n";
+    else if (t1 > t2) cout << "  " << teams[bat_first]   << " WON by " << (t1-t2) << " run(s)!\n";
+    else              cout << "  MATCH TIED — Super Over!\n";
+    
+}
+
+
+
+
+int main() {
+    
+    cout << "   2026 ICC T20 WORLD CUP FINAL\n";
+    cout << "   INDIA  vs  NEW ZEALAND\n";
+    cout << "   Venue: Narendra Modi Stadium, Ahmedabad\n";
+    
+    int schd;
+    cout << "Enter scheduling mode (0 = FCFS, 1 = SJF): ";
+    cin >> schd;
+
+    rag.init();
+    sem_init(&crease_sem, 0, 0);
+
+    int tw      = randomBit();
+    int bf      = -1;
+    string twn  = tw==0 ? "India" : "New Zealand";
+    cout << twn << " won the toss!  ";
+    if (randomBit()) { cout << twn << " elected to BAT.\n";  bf = tw; }
+    else             { cout << twn << " elected to BOWL.\n"; bf = 1-tw; }
+    int bowl_first = 1 - bf;
+
+    // Innings 1
+    pthread_t inn1;
+    InningsArg* ia1 = new InningsArg{bf, bowl_first, 0, schd};
+    pthread_create(&inn1, nullptr, simulateInnings, ia1);
+    pthread_join(inn1, nullptr);
+    printDotGanttChart();
+
+    gantt_log.clear();
+    global_ball = 0;
+
+    int target = innings_score[bf].runs + 1;
+
+    sem_destroy(&crease_sem);
+
+    for (int i = 0; i < NUM_BATTERS; i++) {
+        rag.held[i] = -1;
+        rag.want[i] = -1;
+    }
+
+    for (int i=0;i<NUM_BATTERS;i++) {
+        auto& b = team_batters[bowl_first][i];
+        b.is_out=false; b.at_crease=false; b.crease_end=-1;
+        b.runs_scored=0; b.balls_faced=0; b.dismissal="";
+        b.arrival_ball=0; b.batting_start=0; b.wait_balls=0;
+    }
+    for (int i=0;i<NUM_BOWLERS;i++) {
+        auto& bw = team_bowlers[bf][i];
+        bw.overs_bowled=0; bw.runs_given=0; bw.wickets_taken=0;
+        bw.economy=0.0; bw.saved_balls=0;
+    }
+    match_state.last_over_runs           = 0;
+    match_state.free_hit                 = false;
+    match_state.innings_over[bowl_first] = false;
+
+    // Innings 2
+    pthread_t inn2;
+    InningsArg* ia2 = new InningsArg{bowl_first, bf, target, schd};
+    pthread_create(&inn2, nullptr, simulateInnings, ia2);
+    pthread_join(inn2, nullptr);
+
+    printResult(bf);
+    printDotGanttChart();
+    printWaitTimeAnalysis(bf);
+
+    // Cleanup
+    rag.destroy();
+    sem_destroy(&crease_sem);
+    pthread_mutex_destroy(&pitch_mutex);
+    pthread_mutex_destroy(&score_mutex);
+    pthread_mutex_destroy(&log_mutex);
+    pthread_mutex_destroy(&runout_mutex);
+    pthread_mutex_destroy(&gantt_mutex);
+    pthread_cond_destroy(&ball_hit_cond);
+    return 0;
+}
