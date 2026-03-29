@@ -70,7 +70,7 @@ struct BatterStats {
     string sched_entry   = "";
     double sjf_burst() const {
     double val = batting_avg * strike_rate;
-    return (val > 0) ? (1.0 / val) : 999.0;
+    return (val > 0) ? (val) : 999.0;
 }
 };
 
